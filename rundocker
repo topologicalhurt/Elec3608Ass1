@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# you may need to modify this for your system
+
+if [ $# -eq 1 ]; then
+    dockerfile=$1
+else
+    dockerfile="phwl/elec3608-cad:latest" # the default docker file
+fi
+
+# for arm64 labs we run on the native platform
+if [[ $dockerfile =~ arm64 ]]; then
+    cpu=arm64
+else
+    cpu=amd64                           # the default platform
+fi
+dockerargs="-u 1000 --rm --platform linux/$cpu -it -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -v `pwd`:/config"
+
+echo "docker run $dockerargs $dockerfile"
+docker run $dockerargs $dockerfile
+
