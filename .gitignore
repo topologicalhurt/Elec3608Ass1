@@ -1,3 +1,12 @@
+obj_dir/
+.bash_history
+.dbus/
+.lesshst
+*.o
+*.log
+*.hex
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

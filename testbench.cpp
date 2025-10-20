@@ -1,6 +1,10 @@
 #include "Vtestbench.h"
 #include "verilated_vcd_c.h"
 
+// Called by $time in Verilog; Required by Verilator when using --trace
+vluint64_t main_time = 0;
+double sc_time_stamp() { return main_time; }
+
 int main(int argc, char **argv, char **env)
 {
 	printf("Built with %s %s.\n", Verilated::productName(), Verilated::productVersion());
@@ -35,7 +39,14 @@ int main(int argc, char **argv, char **env)
 		top->clock = !top->clock;
 		top->eval();
 		if (tfp) tfp->dump (t);
+		main_time = t;
 		t += 5;
+		
+		// Safety timeout to prevent infinite simulation  
+		if (t > 500000) {
+			printf("Timeout: Simulation exceeded 500000 time units (%d cycles)\n", t/10);
+			break;
+		}
 	}
 	if (tfp) tfp->close();
 	delete top;
