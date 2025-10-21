@@ -1,9 +1,0 @@
-    # input clock,
-    # input reset,
-    # output trap,
-    # output logic [31:0] x10,
-
-    # // instruction memory
-    # output  [3:0] imem_addr,
-    # input   [31:0] imem_data
-    
