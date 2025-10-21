@@ -25,20 +25,20 @@ VERILATOR = verilator
 RDOCKER = docker run --platform linux/amd64 -it --net host -e DISPLAY=$(DISPLAY) -v `pwd`:/config phwl/elec3608-cad:latest
 
 # this can be simply overridden using make FIRMWAREFILE=... all
-FIRMWAREFILE=test1-hart1-only.hex
+FIRMWAREFILE=tests/test1-hart1-only.hex
 
 # logging file name
-LOGFILE=`basename $(FIRMWAREFILE) .hex`.log
-ASMFILE=`basename $(FIRMWAREFILE) .hex`.s 
-RESULTFILE=results.log
+LOGFILE=tests/`basename $(FIRMWAREFILE) .hex`.log
+ASMFILE=tests/`basename $(FIRMWAREFILE) .hex`.s 
+RESULTFILE=tests/results.log
 
 # all tests
-ALLFIRMWARE=test1-hart1-only.hex test2-hart2-only.hex test3-samecode-bothharts.hex \
-	test4-race-hart1-slowslow.hex test5-race-hart2-slowslow.hex \
-	test6-race-hart1-slow.hex  test7-race-hart2-slow.hex  test8-samecode-2reserv.hex \
-	test9-samecode-1reserv.hex \
-	test10-hart1-inside-hart2.hex  test11-hart1-interleave-hart2.hex \
-	test12-hart1-interleave-hart2.hex  test13-hart2-interleave-hart1.hex
+ALLFIRMWARE=tests/test1-hart1-only.hex tests/test2-hart2-only.hex tests/test3-samecode-bothharts.hex \
+	tests/test4-race-hart1-slowslow.hex tests/test5-race-hart2-slowslow.hex \
+	tests/test6-race-hart1-slow.hex  tests/test7-race-hart2-slow.hex  tests/test8-samecode-2reserv.hex \
+	tests/test9-samecode-1reserv.hex \
+	tests/test10-hart1-inside-hart2.hex  tests/test11-hart1-interleave-hart2.hex \
+	tests/test12-hart1-interleave-hart2.hex  tests/test13-hart2-interleave-hart1.hex
 
 all:	$(FIRMWAREFILE) test_verilator
 
@@ -49,15 +49,15 @@ allresults:
 	@cat $(RESULTFILE)
 
 result : all 
-	@python checkregs.py $(LOGFILE) $(ASMFILE) | tee --append $(RESULTFILE)
+	@python tests/checkregs.py $(LOGFILE) $(ASMFILE) | tee --append $(RESULTFILE)
 
 test_verilator: testbench_verilator 
 	@./obj_dir/Vtestbench +vcd > $(LOGFILE)
 
-testbench_verilator: $(FIRMWAREFILE) testbench-2hart.sv nerv-atomic.sv testbench.cpp 
+testbench_verilator: $(FIRMWAREFILE) tests/testbench-2hart.sv nerv-atomic.sv tests/testbench.cpp 
 	@$(VERILATOR) --cc --exe -Wno-lint -trace --top-module testbench \
 		-Gfirmwarefile=\"$(FIRMWAREFILE)\" \
-		testbench-2hart.sv nerv-atomic.sv testbench.cpp
+		tests/testbench-2hart.sv nerv-atomic.sv tests/testbench.cpp
 	@$(MAKE) -C obj_dir -f Vtestbench.mk
 
 %.elf: %.s 
@@ -75,4 +75,5 @@ rundocker:
 clean:
 	rm -rf firmware.elf firmware.hex testbench testbench.vcd gtkwave.log
 	rm -rf disasm.o disasm.s checks/ cexdata/ obj_dir
+	rm -rf tests/*.log tests/*.hex tests/*.elf
 	rm -rf *.log *.asc *.json *.hex
