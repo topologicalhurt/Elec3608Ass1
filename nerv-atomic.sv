@@ -15,21 +15,11 @@
  *  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  *  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
- *
-
- /* TODO's:
-
- PART 1:
- Need to do handshake with the multicore DRAM instead of using a counter
- to emulate memory access latency (for example, mem_wait_cycles is currently reset to
- a hardcoded value of 1 to simulate register based memory access delay.)
-
- PART 2:
- TODO
-
- PART 3:
- TODO
-
+ *  LR/SC MEMORY SEMANTICS:
+ *  - Reads-before-writes ordering within same cycle
+ *  - Concurrent LR+SC both succeed (only normal stores invalidate LR)
+ *  - Hart 0 has priority for simultaneous SC conflicts
+ *  - Reservation granularity: 4KB
  */
 
 
@@ -41,12 +31,9 @@ module nerv #(
 	input reset,
 	output trap,
 
-	// we have 2 external memories
-	// one is instruction memory
 	output [31:0] imem_addr,
 	input  [31:0] imem_data,
 
-	// the other is data memory
 	output        dmem_valid,
     output        dmem_wr_is_cond,
 	output [31:0] dmem_addr,
@@ -54,20 +41,16 @@ module nerv #(
 	output [31:0] dmem_wdata,
 	input  [31:0] dmem_rdata,
 
-    output dmem_resv,  // reservations
-    input  dmem_cond   // conditional    
+    output dmem_resv,
+    input  dmem_cond
 );
-	// registers, instruction reg, program counter, next pc
 	logic [31:0] regfile [0:NUMREGS-1];
-
 	logic [31:0] pc;
 	wire [31:0] insn;
 	
-	// instruction memory pointer
 	assign imem_addr = pc;
 	assign insn = imem_data;
 	
-	// Decode instruction fields
 	wire [6:0] insn_funct7;
 	wire [4:0] insn_rs2;
 	wire [4:0] insn_rs1;
@@ -77,15 +60,12 @@ module nerv #(
 	
 	assign {insn_funct7, insn_rs2, insn_rs1, insn_funct3, insn_rd, insn_opcode} = insn;
 	
-	// Register file reads
 	wire [31:0] rs1_value = !insn_rs1 ? 0 : regfile[insn_rs1];
 	wire [31:0] rs2_value = !insn_rs2 ? 0 : regfile[insn_rs2];
 	
-	// Immediate values
 	wire [11:0] imm_i = insn[31:20];
 	wire [31:0] imm_i_sext = $signed(imm_i);
 	
-	// Opcodes
 	localparam OPCODE_OP_IMM  = 7'b 00_100_11;
 	localparam OPCODE_OP      = 7'b 01_100_11;
 	localparam OPCODE_LUI     = 7'b 01_101_11;
@@ -95,18 +75,15 @@ module nerv #(
 	localparam OPCODE_BRANCH  = 7'b 11_000_11;
 	localparam OPCODE_LOAD    = 7'b 00_000_11;
 	localparam OPCODE_STORE   = 7'b 01_000_11;
-	localparam OPCODE_AMO     = 7'b 01_011_11;  // Atomic operations
+	localparam OPCODE_AMO     = 7'b 01_011_11;
 	localparam OPCODE_SYSTEM  = 7'b 11_100_11;
 	
-	// AMO funct7[6:2] values for atomic instructions
 	localparam AMO_LR = 5'b00010;
 	localparam AMO_SC = 5'b00011;
 
-	// Acquire access flag & release access flag for atomic instructions
 	wire aq = insn_funct7[1];
 	wire rl = insn_funct7[0];
 	
-	// Control signals
 	logic illegalinsn;
 	logic regwrite;
 	logic [31:0] npc;
@@ -118,19 +95,24 @@ module nerv #(
 	logic [31:0] mem_wdata;
 	logic mem_resv;
 	
-	// Trap signal (for ebreak)
 	assign trap = (insn_opcode == OPCODE_SYSTEM) && (insn_funct3 == 3'b000) && (imm_i == 12'b000000000001);
 
-	// Pipeline signals for zalrsc extension
-	logic [7:0] mem_wait_cycles; // Assume memory responds within 256 cycles
+	// PIPELINE: Memory operations require PC stall and deferred writeback
+	// Set MEM_WAIT_DEFAULT=0 for single-cycle / register based memory (no extra wait)
+	// Set MEM_WAIT_DEFAULT>0 and define MEM_WAIT_MULTICYCLE for multi-cycle memory
+	localparam MEM_WAIT_DEFAULT = 0;
+	// `define MEM_WAIT_MULTICYCLE  // Uncomment for multi-cycle memory support
+
+	`ifdef MEM_WAIT_MULTICYCLE
+		logic [7:0] mem_wait_cycles;
+	`endif
 	logic mem_wait;
 	logic [4:0] mem_rd;
 	logic mem_is_lr;
 	logic mem_is_sc;
 	logic mem_is_load;
-	logic [2:0] mem_load_funct3;  // Store funct3 for load formatting
+	logic [2:0] mem_load_funct3;
 	
-	// Combinational logic for control signals
 	always_comb begin
 		illegalinsn = 0;
 		regwrite = 0;
@@ -143,49 +125,46 @@ module nerv #(
 		mem_resv = 0;
 
 		if (mem_wait) begin
-			npc = pc;  // Stall PC
+			npc = pc;
 		end else begin
 			npc = pc + 4;
 
 			case (insn_opcode)
 				OPCODE_OP_IMM: begin
-					// Immediate arithmetic operations (addi, slti, etc.)
 					regwrite = 1;
 					case (insn_funct3)
-						3'b000: regfiledata = rs1_value + imm_i_sext;  // ADDI
-						3'b010: regfiledata = $signed(rs1_value) < $signed(imm_i_sext) ? 1 : 0;  // SLTI
-						3'b011: regfiledata = rs1_value < imm_i_sext ? 1 : 0;  // SLTIU
-						3'b100: regfiledata = rs1_value ^ imm_i_sext;  // XORI
-						3'b110: regfiledata = rs1_value | imm_i_sext;  // ORI
-						3'b111: regfiledata = rs1_value & imm_i_sext;  // ANDI
-						3'b001: regfiledata = rs1_value << imm_i[4:0];  // SLLI
+						3'b000: regfiledata = rs1_value + imm_i_sext;
+						3'b010: regfiledata = $signed(rs1_value) < $signed(imm_i_sext) ? 1 : 0;
+						3'b011: regfiledata = rs1_value < imm_i_sext ? 1 : 0;
+						3'b100: regfiledata = rs1_value ^ imm_i_sext;
+						3'b110: regfiledata = rs1_value | imm_i_sext;
+						3'b111: regfiledata = rs1_value & imm_i_sext;
+						3'b001: regfiledata = rs1_value << imm_i[4:0];
 						3'b101: begin
 							if (insn_funct7[5]) 
-								regfiledata = $signed(rs1_value) >>> imm_i[4:0];  // SRAI
+								regfiledata = $signed(rs1_value) >>> imm_i[4:0];
 							else
-								regfiledata = rs1_value >> imm_i[4:0];  // SRLI
+								regfiledata = rs1_value >> imm_i[4:0];
 						end
 					endcase
 				end
 				
 				OPCODE_LOAD: begin
-					// Load instructions (lw, lh, lb, etc.)
 					mem_valid = 1;
 					mem_addr = rs1_value + imm_i_sext;
 					regwrite = 1;
 					
 					case (insn_funct3)
-						3'b010: regfiledata = dmem_rdata;  // LW - load word
-						3'b000: regfiledata = {{24{dmem_rdata[7]}}, dmem_rdata[7:0]};  // LB - load byte (sign-extended)
-						3'b001: regfiledata = {{16{dmem_rdata[15]}}, dmem_rdata[15:0]};  // LH - load halfword (sign-extended)
-						3'b100: regfiledata = {24'b0, dmem_rdata[7:0]};  // LBU - load byte unsigned
-						3'b101: regfiledata = {16'b0, dmem_rdata[15:0]};  // LHU - load halfword unsigned
+						3'b010: regfiledata = dmem_rdata;
+						3'b000: regfiledata = {{24{dmem_rdata[7]}}, dmem_rdata[7:0]};
+						3'b001: regfiledata = {{16{dmem_rdata[15]}}, dmem_rdata[15:0]};
+						3'b100: regfiledata = {24'b0, dmem_rdata[7:0]};
+						3'b101: regfiledata = {16'b0, dmem_rdata[15:0]};
 						default: illegalinsn = 1;
 					endcase
 				end
 				
 				OPCODE_AMO: begin
-					// Only support lr.w & sc.w, RV32IA arch
 					if (insn_funct3 == 3'b010) begin
 						mem_valid = 1;
 						mem_addr = rs1_value;
@@ -193,17 +172,15 @@ module nerv #(
 						
 						case (insn_funct7[6:2])
 							AMO_LR: begin
-								// Load-Reserved (lr.w): read from memory, set reservation
 								regfiledata = dmem_rdata;
-								mem_wstrb = 4'b0000;  // Read operation
+								mem_wstrb = 4'b0000;
 								mem_resv = 1;
 							end
 							
 							AMO_SC: begin
-								// Store-Conditional (sc.w): write if reservation valid
 								regfiledata = {31'b0, dmem_cond};
 								mem_wr_is_cond = 1;
-								mem_wstrb = 4'b1111;  // Write full word
+								mem_wstrb = 4'b1111;
 								mem_wdata = rs2_value;
 							end
 							
@@ -217,7 +194,6 @@ module nerv #(
 				default: illegalinsn = 1;
 			endcase
 			
-			// Check unaligned PC (I.e. incorrectly offset word)
 			if ((npc & 32'b11) != 0) begin
 				illegalinsn = 1;
 				npc = pc & ~32'b11;
@@ -225,8 +201,10 @@ module nerv #(
 		end
 	end
 	
-	// Sequential register file and PC updates
-	// Pipelined to handle atomic zalrsc based instructions (lr.w, sc.w) and regular loads
+	// PIPELINE STAGES:
+	// Stage 1: Instruction decode (combinational)
+	// Stage 2: Memory wait for LR/SC/LOAD operations (sequential)
+	// Stage 3: Register writeback (sequential)
 	always_ff @(posedge clock) begin
 		if (reset) begin
 			pc <= RESET_ADDR;
@@ -241,45 +219,53 @@ module nerv #(
 			end
 		end else if (!trap) begin
 
-			// Case 1: memory is ready after waiting
 			if (mem_wait) begin
+				
+			`ifdef MEM_WAIT_MULTICYCLE
+				// Multi-cycle wait: decrement counter until it reaches 0
 				if (mem_wait_cycles == '1) begin
 					$error("Memory operation timed out");
 				end else if (mem_wait_cycles != 0) begin
 					mem_wait_cycles <= mem_wait_cycles - 1;
 				end else begin
 					mem_wait_cycles <= '0;
+			`endif
 
-					if (mem_is_lr) begin
-						regfile[mem_rd] <= dmem_rdata;			// Complete lr.w
-					end else if (mem_is_sc) begin
-						regfile[mem_rd] <= {31'b0, dmem_cond};	// Complete sc.w
-					end else if (mem_is_load) begin
-						// Format the loaded data based on the load type
-						case (mem_load_funct3)
-							3'b010: regfile[mem_rd] <= dmem_rdata;  // LW
-							3'b000: regfile[mem_rd] <= {{24{dmem_rdata[7]}}, dmem_rdata[7:0]};  // LB
-							3'b001: regfile[mem_rd] <= {{16{dmem_rdata[15]}}, dmem_rdata[15:0]};  // LH
-							3'b100: regfile[mem_rd] <= {24'b0, dmem_rdata[7:0]};  // LBU
-							3'b101: regfile[mem_rd] <= {16'b0, dmem_rdata[15:0]};  // LHU
-						endcase
-					end
+			// Complete memory operation and writeback
+			if (mem_is_lr) begin
+				regfile[mem_rd] <= dmem_rdata;
+			end else if (mem_is_sc) begin
+				regfile[mem_rd] <= {31'b0, dmem_cond};
+			end else if (mem_is_load) begin
+				case (mem_load_funct3)
+					3'b010: regfile[mem_rd] <= dmem_rdata;
+					3'b000: regfile[mem_rd] <= {{24{dmem_rdata[7]}}, dmem_rdata[7:0]};
+					3'b001: regfile[mem_rd] <= {{16{dmem_rdata[15]}}, dmem_rdata[15:0]};
+					3'b100: regfile[mem_rd] <= {24'b0, dmem_rdata[7:0]};
+					3'b101: regfile[mem_rd] <= {16'b0, dmem_rdata[15:0]};
+				endcase
+			end
 
-					mem_wait <= 0;
-					mem_is_lr <= 0;
-					mem_is_sc <= 0;
-					mem_is_load <= 0;
-					pc <= pc + 4;  								// Resume PC increment
+			mem_wait <= 0;
+			mem_is_lr <= 0;
+			mem_is_sc <= 0;
+			mem_is_load <= 0;
+			pc <= pc + 4;
+
+			`ifdef MEM_WAIT_MULTICYCLE
 				end
+			`endif
 			end
 			
-			// Case 2: starting a new memory operation
 			else if (mem_valid && (insn_opcode == OPCODE_AMO || insn_opcode == OPCODE_LOAD)) begin
 				mem_wait <= 1;
-				mem_wait_cycles <= 1;	// Wait 1 cycle before checking memory response (for multi-cycle SRAM latency)
-				mem_rd <= insn_rd; 		// Defer insn_rd to be written to later (after waiting for memory)
 
-				// Set flags for atomic operation (can't be done combinationally)
+				`ifdef MEM_WAIT_MULTICYCLE
+					mem_wait_cycles <= MEM_WAIT_DEFAULT;
+				`endif
+
+				mem_rd <= insn_rd;
+
 				if (insn_opcode == OPCODE_AMO) begin
 					if (insn_funct7[6:2] == AMO_LR) begin
 						mem_is_lr <= 1;
@@ -288,15 +274,13 @@ module nerv #(
 					end
 				end else if (insn_opcode == OPCODE_LOAD) begin
 					mem_is_load <= 1;
-					mem_load_funct3 <= insn_funct3;  // Store funct3 to format data later
+					mem_load_funct3 <= insn_funct3;
 				end
 			end
 			
-			// Case 3: instruction doesn't touch memory
 			else begin
 				pc <= npc;
 				
-				// Write to register file
 				if (regwrite && insn_rd != 0) begin
 					regfile[insn_rd] <= regfiledata;
 				end
@@ -304,7 +288,6 @@ module nerv #(
 		end
 	end
 
-	// Memory interface signals
 	assign dmem_valid = mem_valid;
 	assign dmem_wr_is_cond = mem_wr_is_cond;
 	assign dmem_addr = mem_addr;
@@ -314,19 +297,12 @@ module nerv #(
 
 endmodule
 
-
-
-
-
-
-
-
 /****************************************************************************************/
 
 module multicore_memory #(
     parameter MEM_ADDR_WIDTH = 17,
     parameter string fname, 
-    parameter RESV_BITS=12
+    parameter RESV_BITS = 12
 ) (
 	input clock,
 	input reset,
@@ -352,170 +328,150 @@ module multicore_memory #(
 	input  [31:0] dmem_wdata1,
 	output [31:0] dmem_rdata1,
 
-    input  [1:0] dmem_resv,  // reservations
-    output [1:0] dmem_cond   // conditional        
+    input  [1:0] dmem_resv,
+    output [1:0] dmem_cond
 );
-    // THE ACTUAL MEMORY
     reg [7:0] mem [0:(1<<MEM_ADDR_WIDTH)-1];
 
-    // Load firmware into memory
     initial begin
         $readmemh(fname, mem);
     end
 
-    // Instruction memory for hart 0
-    always @* begin
-        imem_data0 = {mem[imem_addr0[MEM_ADDR_WIDTH-1:0] + 3],
-                      mem[imem_addr0[MEM_ADDR_WIDTH-1:0] + 2],
-                      mem[imem_addr0[MEM_ADDR_WIDTH-1:0] + 1],
-                      mem[imem_addr0[MEM_ADDR_WIDTH-1:0] + 0]};
-    end
-
-    // Instruction memory for hart 1
-    always @* begin
-        imem_data1 = {mem[imem_addr1[MEM_ADDR_WIDTH-1:0] + 3],
-                      mem[imem_addr1[MEM_ADDR_WIDTH-1:0] + 2],
-                      mem[imem_addr1[MEM_ADDR_WIDTH-1:0] + 1],
-                      mem[imem_addr1[MEM_ADDR_WIDTH-1:0] + 0]};
-    end
-
-    // ========================================================================
-    // ATOMIC MEMORY OPERATIONS (LR/SC) IMPLEMENTATION
-    // ========================================================================
+    wire [31:0] imem_addr [0:1];
+    reg  [31:0] imem_data [0:1];
     
-    // Step 1: Track reservations for each hart
-    // Each hart can have one active reservation on a memory address
-    // We store the upper bits of the reserved address (using RESV_BITS parameter)
-    reg [RESV_BITS-1:0] resv_addr0;  // Reserved address for hart 0
-    reg [RESV_BITS-1:0] resv_addr1;  // Reserved address for hart 1
-    reg resv_valid0;                  // Is hart 0's reservation valid?
-    reg resv_valid1;                  // Is hart 1's reservation valid?
+    assign imem_addr[0] = imem_addr0;
+    assign imem_addr[1] = imem_addr1;
+    assign imem_data0 = imem_data[0];
+    assign imem_data1 = imem_data[1];
     
-    // Step 2: Check if a memory access conflicts with existing reservations
-    // A conflict occurs when one hart writes to an address that another hart has reserved
-    wire resv_conflict0 = dmem_valid0 && (|dmem_wstrb0) && !dmem_wr_is_cond0 &&
-                          resv_valid1 && (dmem_addr0[RESV_BITS+1:2] == resv_addr1);
-    wire resv_conflict1 = dmem_valid1 && (|dmem_wstrb1) && !dmem_wr_is_cond1 &&
-                          resv_valid0 && (dmem_addr1[RESV_BITS+1:2] == resv_addr0);
-    
-    // Step 3: Determine if SC (Store-Conditional) should succeed
-    // SC succeeds (returns 0) if the reservation is still valid
-    // SC fails (returns 1) if the reservation was invalidated
-    reg dmem_cond0_reg;
-    reg dmem_cond1_reg;
-    assign dmem_cond = {dmem_cond1_reg, dmem_cond0_reg};
-    
-    // Step 4: Manage reservations and perform memory operations for hart 0
-    reg [31:0] dmem_rdata0_reg;
-    assign dmem_rdata0 = dmem_rdata0_reg;
-    
-    always @(posedge clock) begin
-        if (reset) begin
-            // Clear all reservations on reset
-            resv_valid0 <= 0;
-            dmem_cond0_reg <= 1;  // Failed by default
-        end else begin
-            // Check if hart 1 invalidated our reservation
-            if (resv_conflict1) begin
-                resv_valid0 <= 0;
+    genvar h;
+    generate
+        for (h = 0; h < 2; h = h + 1) begin : imem_gen
+            always @* begin
+                imem_data[h] = {mem[imem_addr[h][MEM_ADDR_WIDTH-1:0] + 3],
+                                mem[imem_addr[h][MEM_ADDR_WIDTH-1:0] + 2],
+                                mem[imem_addr[h][MEM_ADDR_WIDTH-1:0] + 1],
+                                mem[imem_addr[h][MEM_ADDR_WIDTH-1:0] + 0]};
             end
+        end
+    endgenerate
+
+    // DUAL-PORT MEMORY WITH PRIORITY: Hart 0 wins write conflicts
+    wire        dmem_valid     [0:1];
+    wire        dmem_wr_is_cond[0:1];
+    wire [31:0] dmem_addr      [0:1];
+    wire [3:0]  dmem_wstrb     [0:1];
+    wire [31:0] dmem_wdata     [0:1];
+    reg  [31:0] dmem_rdata_reg [0:1];
+    
+    assign dmem_valid[0]      = dmem_valid0;
+    assign dmem_valid[1]      = dmem_valid1;
+    assign dmem_wr_is_cond[0] = dmem_wr_is_cond0;
+    assign dmem_wr_is_cond[1] = dmem_wr_is_cond1;
+    assign dmem_addr[0]       = dmem_addr0;
+    assign dmem_addr[1]       = dmem_addr1;
+    assign dmem_wstrb[0]      = dmem_wstrb0;
+    assign dmem_wstrb[1]      = dmem_wstrb1;
+    assign dmem_wdata[0]      = dmem_wdata0;
+    assign dmem_wdata[1]      = dmem_wdata1;
+    assign dmem_rdata0        = dmem_rdata_reg[0];
+    assign dmem_rdata1        = dmem_rdata_reg[1];
+    
+    wire [MEM_ADDR_WIDTH-3:0] write_addr [0:1];
+    assign write_addr[0] = dmem_addr[0][MEM_ADDR_WIDTH-1:2];
+    assign write_addr[1] = dmem_addr[1][MEM_ADDR_WIDTH-1:2];
+    
+    wire write_conflict_normal = dmem_valid[0] && dmem_valid[1] && 
+                                 (|dmem_wstrb[0]) && (|dmem_wstrb[1]) &&
+                                 (!dmem_wr_is_cond[0]) && (!dmem_wr_is_cond[1]) &&
+                                 (write_addr[0] == write_addr[1]);
+
+    wire hart_write_enable [0:1];
+    assign hart_write_enable[0] = dmem_valid[0] && (|dmem_wstrb[0]);
+    assign hart_write_enable[1] = dmem_valid[1] && (|dmem_wstrb[1]) && (!write_conflict_normal);
+    
+    // LR/SC reservation tracking
+    reg [RESV_BITS-1:0] resv_addr  [0:1];
+    reg                 resv_valid [0:1];
+    reg                 dmem_cond_reg [0:1];
+    
+    assign dmem_cond = {dmem_cond_reg[1], dmem_cond_reg[0]};
+    
+	// 4KB reservation offset
+    wire [RESV_BITS-1:0] resv_set [0:1];
+    assign resv_set[0] = dmem_addr[0][11 + RESV_BITS:RESV_BITS];
+    assign resv_set[1] = dmem_addr[1][11 + RESV_BITS:RESV_BITS];
+
+    wire sc_conflict = dmem_valid[0] && dmem_valid[1] &&
+                       dmem_wr_is_cond[0] && dmem_wr_is_cond[1] &&
+                       resv_valid[0] && resv_valid[1] &&
+                       resv_set == resv_addr &&
+                       resv_set[0] == resv_set[1];
+    
+    // PIPELINE: 1) Read pre-cycle memory  2) Compute SC success  3) Apply writes  4) Update reservations
+    generate
+        for (genvar h = 0; h < 2; h++) begin : hart_gen
+            localparam other = 1 - h;
             
-            if (dmem_valid0) begin
-                // Always read the data from memory
-                dmem_rdata0_reg <= {mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 3],
-                                    mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 2],
-                                    mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 1],
-                                    mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 0]};
-                
-                if (dmem_resv[0]) begin
-                    // This is a LR (Load-Reserved) instruction
-                    // Set a reservation on this address
-                    resv_addr0 <= dmem_addr0[RESV_BITS+1:2];
-                    resv_valid0 <= 1;
-                    dmem_cond0_reg <= 0;  // LR always succeeds
-                    
-                end else if (dmem_wr_is_cond0) begin
-                    // This is a SC (Store-Conditional) instruction
-                    // Only write if our reservation is still valid
-                    if (resv_valid0 && (dmem_addr0[RESV_BITS+1:2] == resv_addr0)) begin
-                        // Reservation is valid - SC succeeds!
-                        if (dmem_wstrb0[0]) mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 0] <= dmem_wdata0[7:0];
-                        if (dmem_wstrb0[1]) mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 1] <= dmem_wdata0[15:8];
-                        if (dmem_wstrb0[2]) mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 2] <= dmem_wdata0[23:16];
-                        if (dmem_wstrb0[3]) mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 3] <= dmem_wdata0[31:24];
-                        dmem_cond0_reg <= 0;  // Return 0 (success)
-                        resv_valid0 <= 0;     // Clear the reservation after successful SC
-                    end else begin
-                        // Reservation was lost - SC fails!
-                        dmem_cond0_reg <= 1;  // Return 1 (failure)
+			// Determine if this hart's SC succeeds
+            wire hart_sc_succeeds = dmem_valid[h] && dmem_wr_is_cond[h] && resv_valid[h] &&
+                                    (resv_set[h] == resv_addr[h]) && (h == 0 || !sc_conflict);
+            
+            // Determine if other hart writes to this hart's reserved block (normal store or successful SC)
+            wire other_norm_store_to_this_block = dmem_valid[other] && (|dmem_wstrb[other]) && 
+                                                   (!dmem_wr_is_cond[other]) && (resv_set[other] == resv_addr[h]);
+            wire other_sc_to_this_block = hart_gen[other].hart_sc_succeeds && (resv_set[other] == resv_addr[h]);
+            
+            always @(posedge clock) begin
+                if (reset) begin
+                    resv_valid[h] <= 0;
+                    dmem_cond_reg[h] <= 1;
+                end else begin
+                    // Phase 1: Reads (use pre-write memory state)
+                    if (dmem_valid[h]) begin
+                        dmem_rdata_reg[h] <= {mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 3],
+                                              mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 2],
+                                              mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 1],
+                                              mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 0]};
                     end
                     
-                end else if (|dmem_wstrb0) begin
-                    // This is a normal store (not SC)
-                    // Perform the write and clear our own reservation if we're writing to it
-                    if (dmem_wstrb0[0]) mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 0] <= dmem_wdata0[7:0];
-                    if (dmem_wstrb0[1]) mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 1] <= dmem_wdata0[15:8];
-                    if (dmem_wstrb0[2]) mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 2] <= dmem_wdata0[23:16];
-                    if (dmem_wstrb0[3]) mem[dmem_addr0[MEM_ADDR_WIDTH-1:0] + 3] <= dmem_wdata0[31:24];
-                    
-                    // Clear our own reservation if we're writing to our reserved address
-                    if (resv_valid0 && (dmem_addr0[RESV_BITS+1:2] == resv_addr0)) begin
-                        resv_valid0 <= 0;
+                    // Phase 2: Compute SC results (use pre-update reservation state)
+                    if (dmem_valid[h] && dmem_wr_is_cond[h]) begin
+                        dmem_cond_reg[h] <= hart_sc_succeeds ? 0 : 1;
                     end
+                    
+                    // Phase 3: Writes (apply after reads computed)
+                    if ((dmem_valid[h] && dmem_wr_is_cond[h] && hart_sc_succeeds) ||
+                        (hart_write_enable[h] && (!dmem_wr_is_cond[h]))) begin
+                        if (dmem_wstrb[h][0]) mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 0] <= dmem_wdata[h][7:0];
+                        if (dmem_wstrb[h][1]) mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 1] <= dmem_wdata[h][15:8];
+                        if (dmem_wstrb[h][2]) mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 2] <= dmem_wdata[h][23:16];
+                        if (dmem_wstrb[h][3]) mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 3] <= dmem_wdata[h][31:24];
+                    end
+                    
+                    // Phase 4: Reservation management
+                    if (dmem_valid[h]) begin
+
+                        if (dmem_resv[h]) begin
+                            // LR: Establish new reservation, invalidated only by concurrent normal store to same block
+                            resv_addr[h] <= resv_set[h];
+                            resv_valid[h] <= !other_norm_store_to_this_block;
+                        end else if (dmem_wr_is_cond[h]) begin
+                            // SC: Always clear own reservation
+                            resv_valid[h] <= 0;
+                        end else if (resv_valid[h] && (other_norm_store_to_this_block || other_sc_to_this_block)) begin
+                            // Normal memory op (not LR, not SC): Invalidate if other hart writes to reserved block
+                            resv_valid[h] <= 0;
+                        end
+                    end else if (resv_valid[h] && (other_norm_store_to_this_block || other_sc_to_this_block)) begin
+                        // No operation by this hart: Invalidate if other hart writes to reserved block
+                        resv_valid[h] <= 0;
+                    end
+
                 end
             end
         end
-    end
-    
-    // Step 5: Manage reservations and perform memory operations for hart 1
-    // (Same logic as hart 0, but for the second core)
-    reg [31:0] dmem_rdata1_reg;
-    assign dmem_rdata1 = dmem_rdata1_reg;
-    
-    always @(posedge clock) begin
-        if (reset) begin
-            resv_valid1 <= 0;
-            dmem_cond1_reg <= 1;
-        end else begin
-            if (resv_conflict0) begin
-                resv_valid1 <= 0;
-            end
-            
-            if (dmem_valid1) begin
-                dmem_rdata1_reg <= {mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 3],
-                                    mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 2],
-                                    mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 1],
-                                    mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 0]};
-                
-                if (dmem_resv[1]) begin
-                    resv_addr1 <= dmem_addr1[RESV_BITS+1:2];
-                    resv_valid1 <= 1;
-                    dmem_cond1_reg <= 0;
-                    
-                end else if (dmem_wr_is_cond1) begin
-                    if (resv_valid1 && (dmem_addr1[RESV_BITS+1:2] == resv_addr1)) begin
-                        if (dmem_wstrb1[0]) mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 0] <= dmem_wdata1[7:0];
-                        if (dmem_wstrb1[1]) mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 1] <= dmem_wdata1[15:8];
-                        if (dmem_wstrb1[2]) mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 2] <= dmem_wdata1[23:16];
-                        if (dmem_wstrb1[3]) mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 3] <= dmem_wdata1[31:24];
-                        dmem_cond1_reg <= 0;
-                        resv_valid1 <= 0;
-                    end else begin
-                        dmem_cond1_reg <= 1;
-                    end
-                    
-                end else if (|dmem_wstrb1) begin
-                    if (dmem_wstrb1[0]) mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 0] <= dmem_wdata1[7:0];
-                    if (dmem_wstrb1[1]) mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 1] <= dmem_wdata1[15:8];
-                    if (dmem_wstrb1[2]) mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 2] <= dmem_wdata1[23:16];
-                    if (dmem_wstrb1[3]) mem[dmem_addr1[MEM_ADDR_WIDTH-1:0] + 3] <= dmem_wdata1[31:24];
-                    
-                    if (resv_valid1 && (dmem_addr1[RESV_BITS+1:2] == resv_addr1)) begin
-                        resv_valid1 <= 0;
-                    end
-                end
-            end
-        end
-    end
+    endgenerate
     
 endmodule

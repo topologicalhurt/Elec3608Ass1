@@ -37,7 +37,7 @@ ALLFIRMWARE=test1-hart1-only.hex test2-hart2-only.hex test3-samecode-bothharts.h
 	test4-race-hart1-slowslow.hex test5-race-hart2-slowslow.hex \
 	test6-race-hart1-slow.hex  test7-race-hart2-slow.hex  test8-samecode-2reserv.hex \
 	test9-samecode-1reserv.hex \
-	test10-hart1-inside-hart2.hex  test11-hart2-inside-hart1.hex \
+	test10-hart1-inside-hart2.hex  test11-hart1-interleave-hart2.hex \
 	test12-hart1-interleave-hart2.hex  test13-hart2-interleave-hart1.hex
 
 all:	$(FIRMWAREFILE) test_verilator
