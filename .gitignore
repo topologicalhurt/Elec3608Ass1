@@ -1,10 +1,12 @@
 obj_dir/
+.config/
 .bash_history
 .dbus/
 .lesshst
 *.o
 *.log
 *.hex
+*.vcd
 
 
 # Byte-compiled / optimized / DLL files
