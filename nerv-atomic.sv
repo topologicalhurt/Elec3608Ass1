@@ -222,13 +222,14 @@ module nerv #(
 			if (mem_wait) begin
 				
 			`ifdef MEM_WAIT_MULTICYCLE
-				// Multi-cycle wait: decrement counter until it reaches 0
+				// Multi-cycle stall: decrement counter until it reaches 0
 				if (mem_wait_cycles == '1) begin
 					$error("Memory operation timed out");
 				end else if (mem_wait_cycles != 0) begin
+					// In a more complex out-of-order execution design other pipeline stages could proceed here
+					// I.e. instruction re-ordering so decode stage can continue
 					mem_wait_cycles <= mem_wait_cycles - 1;
 				end else begin
-					mem_wait_cycles <= '0;
 			`endif
 
 			// Complete memory operation and writeback
@@ -357,14 +358,16 @@ module multicore_memory #(
         end
     endgenerate
 
+	localparam N_CORES = 2; // Fixed to 2 for now
+
     // DUAL-PORT MEMORY WITH PRIORITY: Hart 0 wins write conflicts
-    wire        dmem_valid     [0:1];
-    wire        dmem_wr_is_cond[0:1];
-    wire [31:0] dmem_addr      [0:1];
-    wire [3:0]  dmem_wstrb     [0:1];
-    wire [31:0] dmem_wdata     [0:1];
-    reg  [31:0] dmem_rdata_reg [0:1];
-    
+    wire        dmem_valid     [0:N_CORES-1];
+    wire        dmem_wr_is_cond[0:N_CORES-1];
+    wire [31:0] dmem_addr      [0:N_CORES-1];
+    wire [3:0]  dmem_wstrb     [0:N_CORES-1];
+    wire [31:0] dmem_wdata     [0:N_CORES-1];
+    reg  [31:0] dmem_rdata_reg [0:N_CORES-1];
+
     assign dmem_valid[0]      = dmem_valid0;
     assign dmem_valid[1]      = dmem_valid1;
     assign dmem_wr_is_cond[0] = dmem_wr_is_cond0;
@@ -377,52 +380,52 @@ module multicore_memory #(
     assign dmem_wdata[1]      = dmem_wdata1;
     assign dmem_rdata0        = dmem_rdata_reg[0];
     assign dmem_rdata1        = dmem_rdata_reg[1];
-    
-    wire [MEM_ADDR_WIDTH-3:0] write_addr [0:1];
-    assign write_addr[0] = dmem_addr[0][MEM_ADDR_WIDTH-1:2];
-    assign write_addr[1] = dmem_addr[1][MEM_ADDR_WIDTH-1:2];
-    
-    wire write_conflict_normal = dmem_valid[0] && dmem_valid[1] && 
-                                 (|dmem_wstrb[0]) && (|dmem_wstrb[1]) &&
-                                 (!dmem_wr_is_cond[0]) && (!dmem_wr_is_cond[1]) &&
-                                 (write_addr[0] == write_addr[1]);
-
-    wire hart_write_enable [0:1];
-    assign hart_write_enable[0] = dmem_valid[0] && (|dmem_wstrb[0]);
-    assign hart_write_enable[1] = dmem_valid[1] && (|dmem_wstrb[1]) && (!write_conflict_normal);
-    
-    // LR/SC reservation tracking
-    reg [RESV_BITS-1:0] resv_addr  [0:1];
-    reg                 resv_valid [0:1];
-    reg                 dmem_cond_reg [0:1];
-    
     assign dmem_cond = {dmem_cond_reg[1], dmem_cond_reg[0]};
+
+	// LR/SC reservation tracking
+	reg [RESV_BITS-1:0] resv_addr  [0:N_CORES-1];
+	reg                 resv_valid [0:N_CORES-1];
+	reg                 dmem_cond_reg [0:N_CORES-1];
     
 	// 4KB reservation offset
-    wire [RESV_BITS-1:0] resv_set [0:1];
-    assign resv_set[0] = dmem_addr[0][11 + RESV_BITS:RESV_BITS];
-    assign resv_set[1] = dmem_addr[1][11 + RESV_BITS:RESV_BITS];
-
-    wire sc_conflict = dmem_valid[0] && dmem_valid[1] &&
-                       dmem_wr_is_cond[0] && dmem_wr_is_cond[1] &&
-                       resv_valid[0] && resv_valid[1] &&
-                       resv_set == resv_addr &&
-                       resv_set[0] == resv_set[1];
+    wire [RESV_BITS-1:0] resv_set [0:N_CORES-1];
     
     // PIPELINE: 1) Read pre-cycle memory  2) Compute SC success  3) Apply writes  4) Update reservations
     generate
-        for (genvar h = 0; h < 2; h++) begin : hart_gen
+        for (genvar h = 0; h < N_CORES; h++) begin : hart_gen
             localparam other = 1 - h;
-            
-			// Determine if this hart's SC succeeds
-            wire hart_sc_succeeds = dmem_valid[h] && dmem_wr_is_cond[h] && resv_valid[h] &&
-                                    (resv_set[h] == resv_addr[h]) && (h == 0 || !sc_conflict);
+
+			assign resv_set[h] = dmem_addr[h][11 + RESV_BITS:RESV_BITS];
+
+			wire valid_dmem_sc = dmem_valid[h] && dmem_wr_is_cond[h];
+			wire resv_matches_addr = resv_set[h] == resv_addr[h];
+			
+			// SC conflict: this hart conflicts with another hart attempting SC to same block
+			wire sc_conflict = valid_dmem_sc && resv_valid[h] && resv_matches_addr &&
+			                   (hart_gen[other].valid_dmem_sc) && resv_valid[other] &&
+			                   (hart_gen[other].resv_matches_addr) && (resv_set[h] == resv_set[other]);
+
+			wire [MEM_ADDR_WIDTH-3:0] write_addr;
+			assign write_addr = dmem_addr[h][MEM_ADDR_WIDTH-1:2];
+			
+			// Both harts attempting normal store to same address
+			wire hart_write_request;
+			assign hart_write_request = dmem_valid[h] && (|dmem_wstrb[h]);
+			wire write_conflict_normal = hart_write_request && hart_gen[other].hart_write_request &&
+										(!dmem_wr_is_cond[h]) && (!dmem_wr_is_cond[other]) &&
+										(write_addr == hart_gen[other].write_addr);
+			wire hart_write_enable;
+			assign hart_write_enable = hart_write_request && (!write_conflict_normal);
+
+			// Determine if this hart's SC succeeds (Hart 0 wins conflicts)
+            wire hart_sc_succeeds = valid_dmem_sc && resv_valid[h] && resv_matches_addr && (!sc_conflict || h == 0);
             
             // Determine if other hart writes to this hart's reserved block (normal store or successful SC)
             wire other_norm_store_to_this_block = dmem_valid[other] && (|dmem_wstrb[other]) && 
                                                    (!dmem_wr_is_cond[other]) && (resv_set[other] == resv_addr[h]);
             wire other_sc_to_this_block = hart_gen[other].hart_sc_succeeds && (resv_set[other] == resv_addr[h]);
-            
+            wire other_writes_to_this_block = other_norm_store_to_this_block || other_sc_to_this_block;
+
             always @(posedge clock) begin
                 if (reset) begin
                     resv_valid[h] <= 0;
@@ -437,13 +440,13 @@ module multicore_memory #(
                     end
                     
                     // Phase 2: Compute SC results (use pre-update reservation state)
-                    if (dmem_valid[h] && dmem_wr_is_cond[h]) begin
+                    if (valid_dmem_sc) begin
                         dmem_cond_reg[h] <= hart_sc_succeeds ? 0 : 1;
                     end
                     
                     // Phase 3: Writes (apply after reads computed)
-                    if ((dmem_valid[h] && dmem_wr_is_cond[h] && hart_sc_succeeds) ||
-                        (hart_write_enable[h] && (!dmem_wr_is_cond[h]))) begin
+                    if ((valid_dmem_sc && hart_sc_succeeds) ||
+                        (hart_write_enable && (!dmem_wr_is_cond[h]))) begin
                         if (dmem_wstrb[h][0]) mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 0] <= dmem_wdata[h][7:0];
                         if (dmem_wstrb[h][1]) mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 1] <= dmem_wdata[h][15:8];
                         if (dmem_wstrb[h][2]) mem[dmem_addr[h][MEM_ADDR_WIDTH-1:0] + 2] <= dmem_wdata[h][23:16];
@@ -460,11 +463,11 @@ module multicore_memory #(
                         end else if (dmem_wr_is_cond[h]) begin
                             // SC: Always clear own reservation
                             resv_valid[h] <= 0;
-                        end else if (resv_valid[h] && (other_norm_store_to_this_block || other_sc_to_this_block)) begin
+                        end else if (resv_valid[h] && other_writes_to_this_block) begin
                             // Normal memory op (not LR, not SC): Invalidate if other hart writes to reserved block
                             resv_valid[h] <= 0;
                         end
-                    end else if (resv_valid[h] && (other_norm_store_to_this_block || other_sc_to_this_block)) begin
+                    end else if (resv_valid[h] && other_writes_to_this_block) begin
                         // No operation by this hart: Invalidate if other hart writes to reserved block
                         resv_valid[h] <= 0;
                     end
